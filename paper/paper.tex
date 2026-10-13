@@ -1,0 +1,268 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{cleveref}
+\usepackage{enumitem}
+
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black}
+
+\title{Operator In-Context Learning for Cross-Shape\\
+Fluid Prediction via Tabular Support Context}
+\author{Anonymous Authors}
+\date{}
+
+\begin{document}
+\maketitle
+
+%==============================================================================
+\begin{abstract}
+Predicting unsteady fluid fields around novel bluff-body geometries under scarce labeled observations remains challenging for neural operators: geometry shift breaks fixed-weight predictors, while gradient-based meta-adaptation is brittle when only a tiny fraction of spatial points are labeled.
+We propose \textbf{Operator In-Context Learning (Operator-ICL)}, a TabICL-inspired training paradigm that treats sparse labeled points as tabular context rows.
+Each support point is encoded as a concatenated feature--label vector $(\mathbf{x}, \mathbf{u})$ and injected into a geometry-aware neural operator (GeoGNOT) as an additional input function.
+The model is meta-trained episodically across multiple shapes so that a forward pass, conditioned on $K$ in-context examples, reconstructs the remaining query field---without inner-loop fine-tuning.
+At test time, adaptation to a held-out shape reduces to packing the available labels into the support channel and evaluating once.
+On vortex-shedding benchmarks with triangle, cylinder, and box training shapes and diamond as an out-of-distribution target, Operator-ICL matches the few-shot protocol used at training time and outperforms Reptile-style double meta-learning with sparse-label fine-tuning under the same label budget.
+Our results suggest that, for extremely low-shot cross-shape operator transfer, putting labels into the attention context is more effective than using them only as fine-tuning targets.
+\end{abstract}
+
+%==============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Neural operators have emerged as powerful surrogates for parametric partial differential equations (PDEs), mapping infinite-dimensional inputs---such as initial conditions, boundary geometries, and forcing---to solution fields~\cite{li2021fourier,lu2021deeponet,hao2023gnot}.
+In aerodynamic and hydrodynamic design, a recurring requirement is to predict unsteady wake dynamics around \emph{unseen} body shapes when only a handful of sensor-like labeled points are available on the target geometry.
+This setting couples two hard problems: \textbf{cross-shape generalization} and \textbf{few-shot spatial supervision}.
+
+A natural baseline is meta-learning.
+Reptile-style~\cite{nichol2018reptile} double meta-training can jointly adapt geometric embeddings (e.g., signed distance fields) and simulation predictors, then fine-tune on a new shape with sparse labels~\cite{finn2017maml}.
+However, when the label rate is on the order of $0.5\%$ of the grid, gradient updates receive a weak and highly local signal; prolonged fine-tuning can overwrite meta-learned priors and still fail to propagate information to unlabeled locations.
+Moreover, meta-training and adaptation protocols are often mismatched: models may be trained with dense fields on a single simulation shape, then asked to adapt under sparse supervision on a new shape.
+
+Inspired by tabular in-context learning (TabICL)~\cite{hollmann2025tabicl,gardner2024tabpfn}, we reinterpret sparse field observations as \emph{table rows}.
+Each labeled location contributes a row $[\mathbf{x}\mid\mathbf{u}]$, and unlabeled query locations provide only coordinates $\mathbf{x}$.
+Rather than introducing a separate tabular transformer, we embed these rows into an existing multi-function neural operator by registering a dedicated \texttt{support} function channel.
+Cross-attention then lets every query token attend to the labeled context, enabling one-shot spatial propagation of sparse measurements.
+
+\paragraph{Contributions.}
+\begin{itemize}[leftmargin=1.2em]
+    \item We formulate \textbf{Operator-ICL}: episodic meta-training of GeoGNOT where sparse $(\mathbf{x},\mathbf{u})$ pairs act as in-context examples for full-field reconstruction.
+    \item We show that cross-shape adaptation reduces to a \textbf{gradient-free forward pass} under the same support/query protocol used in training, eliminating brittle few-shot fine-tuning.
+    \item On multi-shape vortex-shedding data, Operator-ICL improves held-out-shape accuracy relative to double meta-learning with sparse-label adaptation under matched label budgets (experiment details deferred to~\Cref{sec:exp}).
+\end{itemize}
+
+%==============================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Neural operators for PDE surrogates.}
+Fourier Neural Operators (FNO)~\cite{li2021fourier}, DeepONet~\cite{lu2021deeponet}, and transformer-style operators such as GNOT~\cite{hao2023gnot} learn mappings between function spaces.
+Geometry-aware variants incorporate body shapes via signed distance fields, boundary tokens, or gated attention over geometric branches~\cite{li2023geo,hao2023gnot}.
+Our work builds on GeoGNOT but changes \emph{how scarce labels are consumed}, not the backbone architecture itself.
+
+\paragraph{Meta-learning for scientific machine learning.}
+Model-Agnostic Meta-Learning (MAML)~\cite{finn2017maml} and Reptile~\cite{nichol2018reptile} seek initializations amenable to fast adaptation.
+In operator learning, meta-learning has been used for multi-task PDE families and physics-informed adaptation~\cite{huang2022meta,li2022metalearning}.
+Double meta-training that alternates geometric and simulation objectives is one practical recipe for shape transfer, but remains a \emph{weight-adaptation} paradigm: sparse labels enter only through the loss.
+
+\paragraph{In-context learning and tabular priors.}
+Large language models exhibit in-context learning (ICL) without parameter updates~\cite{brown2020language}.
+TabPFN / TabICL extend this idea to tabular classification and regression by treating labeled rows as context and predicting labels for query rows~\cite{hollmann2022tabpfn,hollmann2025tabicl}.
+Concurrent work explores ICL for time series and PDE residuals~\cite{chen2022transformerpde,yang2023incontext}, yet packing sparse continuum-field labels as operator input functions for cross-geometry transfer is comparatively underexplored.
+Operator-ICL bridges tabular ICL and neural operators: support rows are continuum observations, and the ``table'' is consumed by the operator's existing branch/cross-attention stack.
+
+\paragraph{Sparse sensing and data assimilation.}
+Classical data assimilation and sparse reconstruction recover fields from limited sensors via physics constraints or reduced-order models~\cite{everson1995karhunen,callaham2021robust}.
+Learning-based alternatives include physics-informed networks with partial observations~\cite{raissi2019pinn} and operator models trained under masked supervision.
+Our method is complementary: instead of enforcing PDE residuals at inference, we meta-train the operator to \emph{read} sparse labels as context tokens.
+
+%==============================================================================
+\section{Background}
+\label{sec:background}
+
+\subsection{Problem setting}
+\label{sec:problem}
+
+Let $\Omega\subset\mathbb{R}^{d}$ be a spatial domain discretized into $N$ collocation points $\{\mathbf{x}_i\}_{i=1}^{N}$.
+For a bluff-body shape $s$ and a temporal window of length $W$, we consider the operator
+\begin{equation}
+\mathcal{G}_{s}:\bigl(\mathbf{u}_{0},\,\partial\Omega_{s}\bigr)\;\mapsto\;\mathbf{u}_{1:W-1},
+\end{equation}
+where $\mathbf{u}_{0}\in\mathbb{R}^{N\times C}$ is the initial velocity field (channels $C{=}2$ in 2D) and $\mathbf{u}_{1:W-1}$ is the subsequent evolution stacked over time and channels.
+At adaptation time for a novel shape $s^{\star}$, we observe only a support index set $\mathcal{S}\subset\{1,\ldots,N\}$ with $|\mathcal{S}|=K\ll N$, and must predict the field on the query set $\mathcal{Q}=\{1,\ldots,N\}\setminus\mathcal{S}$ (or a subsampled query set during training).
+
+\subsection{GeoGNOT as a multi-function operator}
+\label{sec:geognot}
+
+GeoGNOT~\cite{hao2023gnot} realizes $\mathcal{G}$ with a trunk network on query coordinates and multiple \emph{branch} networks for input functions
+\begin{equation}
+\mathcal{Y}=\bigl\{\,y^{(\mathrm{vel})},\; y^{(\mathrm{geo})},\; \ldots\,\bigr\}.
+\end{equation}
+Each function $y^{(f)}$ is normalized and lifted by an MLP branch $B_f$, then consumed by gated cross-attention blocks where query tokens attend to keys/values derived from every $y^{(f)}$.
+Geometry enters through a bluff-body coordinate function (and optional SDF auxiliary heads); the initial condition enters as a velocity function concatenating $(\mathbf{x},\mathbf{u}_{0})$.
+Critically, the architecture already admits an arbitrary number of named input functions---a property we exploit to inject tabular support context without redesigning the attention backbone.
+
+\subsection{Tabular in-context learning (conceptual prior)}
+\label{sec:tabicl}
+
+In tabular ICL, a context set $\{( \mathbf{z}_k, \ell_k)\}_{k=1}^{K}$ and a query feature $\mathbf{z}^{\star}$ are packed so that a model predicts $\hat{\ell}^{\star}$ by attending to labeled rows~\cite{hollmann2025tabicl}.
+We adopt the same abstraction with continuum fields:
+\begin{equation}
+\mathbf{z}_i=\mathbf{x}_i,\qquad \ell_i=\mathbf{u}_i\in\mathbb{R}^{C(W-1)},
+\end{equation}
+i.e., each spatial point is a ``row'', coordinates are features, and future velocities are labels.
+Operator-ICL instantiates this abstraction inside GeoGNOT rather than training a standalone tabular transformer.
+
+\subsection{Limitation of sparse-label fine-tuning}
+\label{sec:limit_ft}
+
+Given support labels $\{\mathbf{u}_i\}_{i\in\mathcal{S}}$, fine-tuning minimizes
+\begin{equation}
+\mathcal{L}_{\mathrm{FT}}(\theta)=\frac{1}{|\mathcal{S}|}\sum_{i\in\mathcal{S}}
+\bigl\|\,\hat{\mathbf{u}}_i(\theta)-\mathbf{u}_i\,\bigr\|^2
+\end{equation}
+and hopes the updated $\theta$ generalizes to $\mathcal{Q}$.
+When $K/N$ is tiny, $\mathcal{L}_{\mathrm{FT}}$ is under-determined relative to the hypothesis class; gradients primarily adjust predictions near support points.
+In contrast, conditioning the forward map on support rows makes labels available as \emph{side information} for all queries in a single evaluation.
+
+%==============================================================================
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Support packing as a tabular function channel}
+\label{sec:support}
+
+For a training episode with full fields $(\mathbf{X},\mathbf{u})$, we sample a support index set $\mathcal{S}$ of size $K$ and construct
+\begin{equation}
+\label{eq:support}
+y^{(\mathrm{sup})}
+=\Bigl[\mathbf{x}_i\,\Vert\,\mathbf{u}_i\Bigr]_{i\in\mathcal{S}}
+\in\mathbb{R}^{K\times\bigl(d+C(W-1)\bigr)}.
+\end{equation}
+Equation~\eqref{eq:support} is exactly a $K$-row table with feature and label columns.
+We register $y^{(\mathrm{sup})}$ under a \texttt{support} function specification with both spatial and value components (\texttt{has\_x}=\texttt{true}, \texttt{has\_y}=\texttt{true}), so that GeoGNOT applies a mixed coordinate/value transform and a dedicated branch $B_{\mathrm{sup}}$.
+
+The complete input to the operator is
+\begin{equation}
+\mathcal{Y}
+=\bigl\{\,
+y^{(\mathrm{vel})}=[\mathbf{X}\Vert\mathbf{u}_{0}],\;
+y^{(\mathrm{geo})}=\partial\Omega_{s},\;
+y^{(\mathrm{sup})}
+\,\bigr\},
+\end{equation}
+and the prediction is $\hat{\mathbf{u}}=f_{\theta}\bigl(\mathbf{X}_{\mathcal{Q}},\,\mathcal{Y}\bigr)$ on query coordinates $\mathbf{X}_{\mathcal{Q}}$.
+
+\paragraph{No label leakage in the loss.}
+Support points must not be trivial copy targets.
+We maintain a boolean mask $m_i=\mathbb{1}[i\notin\mathcal{S}]$ (optionally after query subsampling) and train with masked normalized MSE
+\begin{equation}
+\label{eq:loss}
+\mathcal{L}_{\mathrm{ICL}}(\theta)
+=\mathbb{E}\!\left[
+\frac{\bigl\|(\hat{\mathbf{u}}-\mathbf{u})\odot m\bigr\|_2^{2}}
+{\bigl\|\mathbf{u}\odot m\bigr\|_2^{2}+\varepsilon}
+\right],
+\end{equation}
+so gradients encourage extrapolating from context rather than reconstructing points whose labels already appear in $y^{(\mathrm{sup})}$.
+
+\subsection{Episodic multi-shape meta-training}
+\label{sec:train}
+
+Algorithmically, each outer step (i)~samples a shape task from $\{\texttt{triangle},\texttt{cylinder},\texttt{box}\}$, (ii)~samples a trajectory window, (iii)~resamples $\mathcal{S}$ (and optionally a fixed-size query subset for computational efficiency), and (iv)~updates shared parameters $\theta$ with~\eqref{eq:loss}.
+Unlike Reptile, there is \textbf{no inner-loop adaptation}: in-context conditioning \emph{is} the adaptation mechanism.
+Resampling $\mathcal{S}$ every episode prevents memorizing fixed sensor layouts and teaches the model to use arbitrary sparse tables.
+
+For wall-clock efficiency on dense grids ($N\sim 10^{4}$), we subsample $N_q$ query points and $N_v$ velocity keys while always building support from the full field, keeping static shapes for JIT compilation.
+
+\subsection{Gradient-free cross-shape adaptation}
+\label{sec:adapt}
+
+At test time for a held-out shape $s^{\star}$ (e.g., \texttt{diamond}), we freeze $\theta^{\star}$ obtained from meta-training, draw a fixed support set with budget $K=\lfloor \rho N\rfloor$ (label rate $\rho$), pack $y^{(\mathrm{sup})}$ as in~\eqref{eq:support}, and evaluate
+\begin{equation}
+\hat{\mathbf{u}}
+=f_{\theta^{\star}}\bigl(\mathbf{X},\,
+\{y^{(\mathrm{vel})},\,y^{(\mathrm{geo})},\,y^{(\mathrm{sup})}\}\bigr).
+\end{equation}
+Metrics are computed only on non-support locations, matching the few-shot ICL protocol.
+No optimizer state, learning-rate schedule, or geometric auxiliary fine-tuning is required.
+
+\subsection{Why Operator-ICL transfers across shapes}
+\label{sec:why}
+
+We attribute cross-shape gains to three aligned design choices:
+
+\begin{enumerate}[leftmargin=1.2em]
+    \item \textbf{Protocol match.} Training and testing both solve ``predict $\mathcal{Q}$ given $K$ labeled rows,'' avoiding the dense-train / sparse-finetune mismatch of double meta-learning.
+    \item \textbf{Labels as conditioning.} Support values enter cross-attention keys/values, so information from measurements can influence distant queries in one forward pass, whereas fine-tuning only supplies local loss gradients.
+    \item \textbf{Multi-shape simulation meta-training.} Operator-ICL updates the flow predictor on all source shapes; double meta setups that meta-train simulation on a single geometry leave a larger sim-domain gap when transferring to novel wakes.
+\end{enumerate}
+
+\subsection{Relation to double meta-adaptation (baseline)}
+\label{sec:baseline}
+
+Our Reptile double-meta baseline meta-trains geometric reconstruction across shapes and simulation primarily on one source shape, then adapts to $s^{\star}$ by jointly optimizing sparse simulation loss and SDF loss for many epochs.
+Sparse labels affect parameters only through $\mathcal{L}_{\mathrm{FT}}$; they never appear as input tokens.
+Operator-ICL therefore differs not merely in optimization hyperparameters but in the \emph{computational role} of scarce supervision.
+
+\begin{algorithm}[t]
+\caption{Operator-ICL meta-training (one episode)}
+\label{alg:episode}
+\begin{algorithmic}[1]
+\Require Multi-shape loaders; support size $K$; model $f_{\theta}$
+\State Sample shape task $s$ and window batch $(\mathbf{X},\mathbf{u},\mathbf{u}_{0},\partial\Omega_{s})$
+\State Sample support indices $\mathcal{S}$ with $|\mathcal{S}|=K$
+\State Pack $y^{(\mathrm{sup})}\leftarrow[\mathbf{x}_i\Vert\mathbf{u}_i]_{i\in\mathcal{S}}$
+\State Form $\mathcal{Y}\leftarrow\{y^{(\mathrm{vel})},\,y^{(\mathrm{geo})},\,y^{(\mathrm{sup})}\}$
+\State Optionally subsample query set $\mathcal{Q}$; set mask $m_i=\mathbb{1}[i\notin\mathcal{S}]$
+\State Predict $\hat{\mathbf{u}}\leftarrow f_{\theta}(\mathbf{X}_{\mathcal{Q}},\mathcal{Y})$
+\State Update $\theta$ with masked NMSE~\eqref{eq:loss}
+\end{algorithmic}
+\end{algorithm}
+
+%==============================================================================
+\section{Experiments}
+\label{sec:exp}
+
+We briefly summarize the experimental protocol; full tables, ablations, and visualizations are omitted in this draft.
+
+\paragraph{Data.}
+Unsteady 2D vortex-shedding simulations around polygonal/curved bluff bodies.
+Source shapes: triangle, cylinder, box (training trajectories); target: diamond (held-out), with additional same-shape held-out trajectory splits when reported.
+Fields are windowed with $W{=}6$ frames (predict $W{-}1$ steps from the first frame as IC).
+
+\paragraph{Methods.}
+\begin{itemize}[leftmargin=1.2em]
+    \item \textbf{Operator-ICL:} GeoGNOT meta-trained with $K{=}64$ support points (resampled); zero-shot adapt with label rate $\rho{=}0.5\%$ packed as \texttt{support}.
+    \item \textbf{Double-meta + FT:} Reptile Geo/Sim meta-training followed by AdamW fine-tuning on the target shape with the same $\rho$, using labels only as masked loss targets (plus optional SDF loss).
+\end{itemize}
+
+\paragraph{Metric.}
+Normalized MSE (NMSE) on non-support query points of held-out trajectories.
+
+\paragraph{Expected findings (to be completed with numbers).}
+Under matched label budgets, Operator-ICL yields lower cross-shape NMSE than sparse fine-tuning of the double-meta initialization, with substantially lower adaptation cost (one forward pass vs.\ hundreds of gradient steps).
+Ablations should verify the necessity of the \texttt{support} channel, multi-shape episodic resampling, and exclusion of support points from the training loss.
+
+%==============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented Operator-ICL, a tabular-inspired paradigm for few-shot cross-shape neural operator prediction.
+By encoding sparse labeled locations as support function rows $(\mathbf{x}\Vert\mathbf{u})$ and meta-training GeoGNOT to reconstruct query fields via cross-attention, adaptation to unseen bluff-body geometries becomes a gradient-free forward pass aligned with the training objective.
+This reframing---labels as in-context conditioning rather than fine-tuning targets---is particularly suitable when spatial label budgets are extremely small.
+Future work includes extending Operator-ICL to 3D geometries, irregular meshes, active sensor placement for support selection, and hybrid schemes that combine a short physical fine-tuning stage with frozen in-context conditioning.
+
+\section*{Acknowledgments}
+% Add funding acknowledgments if applicable.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

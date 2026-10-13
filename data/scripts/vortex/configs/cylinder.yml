@@ -1,0 +1,16 @@
+shape: cylinder
+N: 20
+nx: 180
+ny: 81
+T_0: 50
+T_max: 150
+dT: 20
+# u_max
+length: 20
+reynolds: 150
+boundary_config:
+  x_min: 40
+  y_min: 30
+  x_max: 90
+  y_max: 50
+  radius: 10
